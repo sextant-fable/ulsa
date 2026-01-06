@@ -1,7 +1,7 @@
 """Implements entropy calculation taken from `zea.agent.selection.GreedyEntropy` but simplified
 and working for N-D data."""
 
-from keras import ops
+import torch
 
 
 def pairwise_pixel_gaussian_error(particles, entropy_sigma=1.0):
@@ -22,14 +22,14 @@ def pairwise_pixel_gaussian_error(particles, entropy_sigma=1.0):
     assert particles.shape[1] > 1, (
         "The entropy cannot be approximated using a single particle."
     )
-    particles = ops.cast(particles, "float32")
+    particles = particles.float()
 
     # TODO: I think we only need to compute the lower triangular
     # of this matrix, since it's symmetric
     squared_l2_error_matrices = (
         particles[:, :, None, ...] - particles[:, None, :, ...]
     ) ** 2
-    gaussian_error_per_pixel_i_j = ops.exp(
+    gaussian_error_per_pixel_i_j = torch.exp(
         -(squared_l2_error_matrices) / (2 * entropy_sigma**2)
     )
     # [batch_size, n_particles, n_particles, *pixels]
@@ -48,19 +48,19 @@ def pixelwise_entropy(particles, entropy_sigma=1.0):
     Returns:
         Tensor: batch of entropies per pixel of shape (batch_size, *pixels)
     """
-    n_particles = ops.shape(particles)[1]
+    n_particles = particles.shape[1]
     gaussian_error_per_pixel_stacked = pairwise_pixel_gaussian_error(
         particles, entropy_sigma
     )
     # sum out first dimension of (n_particles x n_particles) error matrix
     # [n_particles, batch, height, width]
-    pixelwise_entropy_sum_j = ops.sum(
-        (1 / n_particles) * gaussian_error_per_pixel_stacked, axis=1
+    pixelwise_entropy_sum_j = torch.sum(
+        (1 / n_particles) * gaussian_error_per_pixel_stacked, dim=1
     )
-    log_pixelwise_entropy_sum_j = ops.log(pixelwise_entropy_sum_j)
+    log_pixelwise_entropy_sum_j = torch.log(pixelwise_entropy_sum_j)
     # sum out second dimension of (n_particles x n_particles) error matrix
     # [batch, height, width]
-    pixelwise_entropy = -ops.sum(
-        (1 / n_particles) * log_pixelwise_entropy_sum_j, axis=1
+    pixelwise_entropy = -torch.sum(
+        (1 / n_particles) * log_pixelwise_entropy_sum_j, dim=1
     )
     return pixelwise_entropy
