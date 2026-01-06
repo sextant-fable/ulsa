@@ -2,9 +2,9 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, Callable, Tuple
 
-import jax
 import keras
 import numpy as np
+import torch
 from keras import ops
 from rich.console import Console
 from rich.table import Table
@@ -27,9 +27,21 @@ from zea.agent.selection import (
 from zea.backend import jit
 from zea.config import Config
 from zea.models.diffusion import DiffusionModel
-from zea.tensor_ops import split_seed
 
 DEBUGGING = False
+
+
+def _normalize_seed(seed_value):
+    if isinstance(seed_value, torch.Generator):
+        return int(seed_value.initial_seed())
+    return int(seed_value)
+
+
+def split_seed(seed_value, num_splits):
+    base = _normalize_seed(seed_value)
+    seeds = [base + i for i in range(num_splits)]
+    next_seed = base + num_splits
+    return seeds, next_seed
 
 
 # Static agent properties go here
@@ -70,7 +82,6 @@ class Agent:
 
 
 # dynamic agent properties go here
-@jax.tree_util.register_pytree_node_class
 @dataclass
 class AgentState:
     measurement_buffer: FrameBuffer
@@ -82,26 +93,6 @@ class AgentState:
     pipeline_state: Any
     target_pipeline_state: Any
     saliency_map: Any  # heatmap used to make action selection decisions
-
-    def tree_flatten(self):
-        # All fields are dynamic
-        children = (
-            self.measurement_buffer,
-            self.mask,
-            self.seed,
-            self.selected_lines,
-            self.posterior_samples,
-            self.belief_distribution,
-            self.pipeline_state,
-            self.target_pipeline_state,
-            self.saliency_map,
-        )
-        aux = None
-        return children, aux
-
-    @classmethod
-    def tree_unflatten(cls, aux, children):
-        return cls(*children)
 
 
 def get_initial_action_selection_fn(
@@ -360,51 +351,40 @@ def setup_agent(
             return ops.squeeze(posterior_samples, axis=0)
 
         measurements = ops.expand_dims(measurements, axis=1)  # add dummy batch dim
-        seeds = split_seed(seed, len(measurements))
+        seeds, _ = split_seed(seed, len(measurements))
         omega = agent_config.diffusion_inference.guidance_kwargs.omega
         if initial_samples is None:
             initial_omega = agent_config.diffusion_inference.guidance_kwargs.get(
                 "initial_omega", omega
             )
-            if DEBUGGING:
-                psi = lambda meas, seed: posterior_sample_individual(
-                    (meas, seed, None, 0, initial_omega)
-                )
-                posterior_samples = ops.stack(
-                    [psi(m, s) for m, s in zip(measurements, seeds)]
-                )
-            else:
-                posterior_samples = ops.vectorized_map(
-                    lambda meas_seed: posterior_sample_individual(
-                        (*meas_seed, None, 0, initial_omega)
-                    ),
-                    (measurements, seeds),
-                )
+            posterior_samples = ops.stack(
+                [
+                    posterior_sample_individual(
+                        (m, s, None, 0, initial_omega)
+                    )
+                    for m, s in zip(measurements, seeds)
+                ],
+                axis=0,
+            )
         else:
             initial_samples = initial_samples[
                 :, None, None
             ]  # add dummy batch and particle dim
-            if DEBUGGING:
-                psi = lambda meas, seed, inits: posterior_sample_individual(
-                    (meas, seed, inits, 0, initial_omega)
-                )
-                posterior_samples = ops.stack(
-                    [
-                        psi(m, s, i)
-                        for m, s, i in zip(measurements, seeds, initial_samples)
-                    ]
-                )
-            else:
-                posterior_samples = ops.vectorized_map(
-                    lambda meas_seed_inits: posterior_sample_individual(
+            posterior_samples = ops.stack(
+                [
+                    posterior_sample_individual(
                         (
-                            *meas_seed_inits,
+                            m,
+                            s,
+                            i,
                             agent_config.diffusion_inference.initial_step,
                             omega,
                         )
-                    ),
-                    (measurements, seeds, initial_samples),
-                )
+                    )
+                    for m, s, i in zip(measurements, seeds, initial_samples)
+                ],
+                axis=0,
+            )
 
         # remove dummy batch dim
         posterior_samples = ops.squeeze(posterior_samples, axis=1)
@@ -547,7 +527,8 @@ def recover(
 
     measurement_buffer.shift(measurements)
 
-    seed_1, seed_2, base_seed = split_seed(base_seed, 3)
+    seed_list, base_seed = split_seed(base_seed, 3)
+    seed_1, seed_2, _ = seed_list
 
     # 2. recover current beliefs from measurements
     new_posterior_samples = posterior_sample(

@@ -1,14 +1,13 @@
 from abc import ABC
 
 import cv2
-import jax
 import numpy as np
+import torch
 from keras import ops
 
 import zea
 from models.deeplabv3_segmenter import DeeplabV3Plus
 from ulsa.io_utils import deg2rad
-from zea.backend.autograd import AutoGrad
 from zea.display import compute_scan_convert_2d_coordinates, scan_convert_2d
 from zea.internal.registry import RegisterDecorator
 from zea.models.echonet import EchoNetDynamic
@@ -178,62 +177,52 @@ class EchoNetSegmentation(DifferentiableDownstreamTask):
             mask_logits = self.call_differentiable(x_scan_converted)
             return mask_logits
 
-        key = jax.random.PRNGKey(0)  # TODO: pass in global key?
         num_hutchinson_samples = 5
 
-        mask_logits = call_echonet(x)
+        x_t = torch.as_tensor(x, dtype=torch.float32)
+        x_t.requires_grad_(True)
 
-        z_squared = ops.zeros_like(mask_logits)
-        for i in range(num_hutchinson_samples):
-            subkey = jax.random.fold_in(key, i)
-            v = jax.random.normal(subkey, mask_logits.shape)
-            # vjp returns a function that computes J^T v
-            _, vjp_fun = jax.vjp(call_echonet, x)
-            jt_v = vjp_fun(v)[0]  # [0] to get the input tangent
-            z_squared += jt_v**2
+        mask_logits = call_echonet(x_t)
 
-        posterior_variance = ops.expand_dims(ops.var(x, axis=0), axis=0)
+        z_squared = torch.zeros_like(mask_logits)
+        for _ in range(num_hutchinson_samples):
+            v = torch.randn_like(mask_logits)
+            grad = torch.autograd.grad(
+                (mask_logits * v).sum(), x_t, retain_graph=True
+            )[0]
+            z_squared = z_squared + grad**2
 
-        return mask_logits, posterior_variance * z_squared
+        posterior_variance = torch.var(x_t.detach(), dim=0, keepdim=True)
+
+        return mask_logits.detach(), posterior_variance * z_squared.detach()
 
     def compute_output_and_saliency_propagation_summed(self, x):
-        autograd = AutoGrad()
+        x_t = torch.as_tensor(x, dtype=torch.float32)
+        x_t.requires_grad_(True)
 
-        def call_echonet(posterior_samples):
-            x_scan_converted = self.scan_convert_batch(posterior_samples)
-            mask_logits = self.call_differentiable(x_scan_converted)
-            return ops.sum(mask_logits), mask_logits
+        x_scan_converted = self.scan_convert_batch(x_t)
+        mask_logits = self.call_differentiable(x_scan_converted)
+        loss = mask_logits.sum()
+        grads = torch.autograd.grad(loss, x_t)[0]
 
-        autograd.set_function(call_echonet)
-        echonet_grad_and_value_fn = autograd.get_gradient_and_value_jit_fn(has_aux=True)
-        grads, (_, mask_logits) = echonet_grad_and_value_fn(x)
-
-        posterior_variance = ops.expand_dims(ops.var(x, axis=0), axis=0)
-        mean_absolute_jacobian = ops.expand_dims(
-            ops.mean(ops.abs(grads), axis=0), axis=0
-        )
-        return mask_logits, posterior_variance * mean_absolute_jacobian
+        posterior_variance = torch.var(x_t.detach(), dim=0, keepdim=True)
+        mean_absolute_jacobian = torch.mean(torch.abs(grads), dim=0, keepdim=True)
+        return mask_logits.detach(), posterior_variance * mean_absolute_jacobian
 
     def compute_output_and_saliency_gradient_descent(self, x):
-        autograd = AutoGrad()
+        x_t = torch.as_tensor(x, dtype=torch.float32)
+        x_t.requires_grad_(True)
 
-        def call_echonet(posterior_samples):
-            x_scan_converted = self.scan_convert_batch(posterior_samples)
-            mask_logits = self.call_differentiable(x_scan_converted)
-            return ops.sum(ops.var(mask_logits, axis=0)), mask_logits
+        x_scan_converted = self.scan_convert_batch(x_t)
+        mask_logits = self.call_differentiable(x_scan_converted)
+        loss = torch.var(mask_logits, dim=0).sum()
+        grads = torch.autograd.grad(loss, x_t)[0]
 
-        autograd.set_function(call_echonet)
-        echonet_grad_and_value_fn = autograd.get_gradient_and_value_jit_fn(has_aux=True)
-
-        grads, (_, mask_logits) = echonet_grad_and_value_fn(x)
-
-        posterior_mean = ops.expand_dims(ops.mean(x, axis=0), axis=0)
-        expected_change = -(x - posterior_mean)
-        expected_effects_of_change = expected_change * grads
-        saliency = (
-            -expected_effects_of_change
-        )  # negative because we want to minimize the variance
-        return mask_logits, ops.expand_dims(ops.mean(saliency, axis=0), axis=0)
+        posterior_mean = torch.mean(x_t.detach(), dim=0, keepdim=True)
+        expected_change = -(x_t.detach() - posterior_mean)
+        expected_effects_of_change = expected_change * grads.detach()
+        saliency = -expected_effects_of_change
+        return mask_logits.detach(), torch.mean(saliency, dim=0, keepdim=True)
 
     def get_compute_output_and_saliency_fn(self, selection_strategy):
         if selection_strategy == "downstream_propagation_summed":

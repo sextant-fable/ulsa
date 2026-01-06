@@ -1,9 +1,9 @@
 import copy
 from typing import List
 
-import jax
 import keras
 import numpy as np
+import torch
 from keras import ops
 from tqdm import tqdm
 
@@ -24,16 +24,13 @@ def select_transmits_from_pfield(pfield, transmits):
     # transmits: (n_indices, c) -- indices into n_tx
     # Output: (grid_size_z, grid_size_x, c)
 
-    # Gather for each column in transmits
-    def gather_column(transmits):
-        # transmits: (n_indices,)
-        return pfield[transmits, :, :]  # (n_indices, grid_size_z, grid_size_x)
+    pfield_t = torch.as_tensor(pfield)
+    transmits_t = torch.as_tensor(transmits, dtype=torch.long, device=pfield_t.device)
 
-    # Apply over columns of transmits
-    gathered = jax.vmap(gather_column, out_axes=-1)(transmits.T)
-    # gathered: (n_indices, grid_size_z, grid_size_x, c)
+    gathered_cols = [pfield_t[col, :, :] for col in transmits_t.T]
+    gathered = torch.stack(gathered_cols, dim=-1)
 
-    output = ops.sum(gathered, axis=0)  # (grid_size_z, grid_size_x, c)
+    output = torch.sum(gathered, dim=0)  # (grid_size_z, grid_size_x, c)
     return output
 
 

@@ -14,6 +14,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import scipy
+import torch
 from tqdm import tqdm
 
 
@@ -29,9 +30,9 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        default="jax",
+        default="torch",
         help="ML backend to use",
-        choices=["tensorflow", "torch", "jax"],
+        choices=["torch"],
     )
     parser.add_argument(
         "--target_sequence",
@@ -88,6 +89,7 @@ if __name__ == "__main__":
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     from zea import init_device
 
+    torch.manual_seed(args.seed)
     init_device()
 
 
@@ -97,7 +99,6 @@ from keras import ops
 if __name__ == "__main__":
     keras.mixed_precision.set_global_policy(args.precision)
 
-import jax
 from keras.src import backend
 
 import zea.ops
@@ -528,7 +529,7 @@ def active_sampling_single_file(
 
     agent, agent_state = setup_agent(
         agent_config,
-        seed=jax.random.PRNGKey(seed),
+        seed=seed,
         pfield=pfield,
         jit_mode="recover",
         # jit_mode=None,

@@ -1,8 +1,7 @@
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
 import numpy as np
+import torch
 from keras import ops
 
 import zea.ops
@@ -13,19 +12,25 @@ NOISE_ESTIMATION_NORMALIZER = (
 )
 
 
+def _to_torch(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(x)
+
+
 def soft_threshold(data, value, substitute=0):
-    magnitude = ops.absolute(data)
+    tensor = _to_torch(data)
+    magnitude = torch.abs(tensor)
 
     # divide by zero okay as np.inf values get clipped, so ignore warning.
     thresholded = 1 - value / magnitude
-    ops.clip(thresholded, 0, None)
-    thresholded = data * thresholded
+    thresholded = torch.clamp(thresholded, min=0)
+    thresholded = tensor * thresholded
 
     if substitute == 0:
         return thresholded
-    else:
-        cond = ops.less(magnitude, value)
-        return ops.where(cond, substitute, thresholded)
+    cond = magnitude < value
+    return torch.where(cond, torch.as_tensor(substitute, device=tensor.device, dtype=tensor.dtype), thresholded)
 
 
 def wavelet_denoise_rf(rf_signal, wavelet="db4", level=4, threshold_factor=0.5):
@@ -41,31 +46,30 @@ def wavelet_denoise_rf(rf_signal, wavelet="db4", level=4, threshold_factor=0.5):
     Returns:
     - Denoised RF signal
     """
-    import jaxwt as jwt  # pip install jaxwt
-    # import pywt  # pip install PyWavelets
+    import pywt  # pip install PyWavelets
 
-    rf_signal = rf_signal[None]  # add batch dimension
+    rf_tensor = _to_torch(rf_signal).float()
+    rf_np = rf_tensor.detach().cpu().numpy()[None]  # add batch dimension
 
     # Decompose
-    coeffs = jwt.wavedec(rf_signal, wavelet, level=level)
+    coeffs = pywt.wavedec(rf_np, wavelet, level=level, axis=-1)
 
     # Estimate noise from the detail coefficients at the highest level
-    sigma = ops.median(ops.abs(coeffs[-1])) / NOISE_ESTIMATION_NORMALIZER
-    threshold = threshold_factor * sigma * ops.sqrt(2 * ops.log(rf_signal.shape[-1]))
+    sigma = np.median(np.abs(coeffs[-1])) / NOISE_ESTIMATION_NORMALIZER
+    threshold = threshold_factor * sigma * np.sqrt(2 * np.log(rf_np.shape[-1]))
 
-    # Threshold detail coefficients in parallel using jax.vmap
+    # Threshold detail coefficients
     new_coeffs = [coeffs[0]]  # Keep approximation unaltered
 
     def threshold_fn(c):
-        return soft_threshold(c, threshold)
+        return soft_threshold(torch.from_numpy(c), threshold).detach().cpu().numpy()
 
-    # Use jax.vmap to parallelize over the list of detail coefficients
-    new_coeffs += list(jax.tree.map(threshold_fn, coeffs[1:]))
+    new_coeffs += [threshold_fn(c) for c in coeffs[1:]]
 
     # Reconstruct signal
-    out = jwt.waverec(new_coeffs, wavelet)
+    out = pywt.waverec(new_coeffs, wavelet, axis=-1)
 
-    return ops.squeeze(out, axis=0)  # remove batch dimension
+    return torch.from_numpy(out.squeeze(0)).to(rf_tensor.device)
 
 
 def wavelet_denoise_full(data, axis, **kwargs):
@@ -104,14 +108,14 @@ class GetAutoDynamicRange(zea.ops.Operation):
 
         # Exclude zeros, useful for active scan-line selection :)
         if self.exclude_zeros:
-            data = jnp.where(data != 0, data, jnp.nan)
+            data = np.where(data != 0, data, np.nan)
 
         if vmin is None:
-            vmin = jnp.nanquantile(data, self.low_pct / 100)
-            vmin = 20 * ops.log10(vmin)
+            vmin = np.nanquantile(data, self.low_pct / 100)
+            vmin = 20 * np.log10(vmin)
         if vmax is None:
-            vmax = jnp.nanquantile(data, self.high_pct / 100)
-            vmax = 20 * ops.log10(vmax)
+            vmax = np.nanquantile(data, self.high_pct / 100)
+            vmax = 20 * np.log10(vmax)
 
         return {"dynamic_range": [vmin, vmax]}
 
@@ -221,12 +225,12 @@ def apply_along_axis(func, axis, arr):
 
     Based on [np.apply_along_axis](https://numpy.org/devdocs/reference/generated/numpy.apply_along_axis.html)
     """
-    arr = ops.moveaxis(arr, axis, -1)
-    ndim = ops.ndim(arr)
-    for _ in range(ndim - 1):
-        func = jax.vmap(func)
-    result = func(arr)
-    return ops.moveaxis(result, -1, axis)
+    arr_t = _to_torch(arr)
+    arr_moved = torch.movedim(arr_t, axis, -1)
+    slices = torch.unbind(arr_moved, dim=-1)
+    processed = [func(slice) for slice in slices]
+    result = torch.stack(processed, dim=-1)
+    return torch.movedim(result, -1, axis)
 
 
 class FirFilter(zea.ops.Operation):
