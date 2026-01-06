@@ -4,14 +4,13 @@ Prototypes for additional `zea` selection functions
 
 """
 
-import jax
 import numpy as np
+import torch
 from keras import ops
 
 from ulsa.downstream_task import DifferentiableDownstreamTask, downstream_task_registry
 from zea.agent import masks
 from zea.agent.selection import GreedyEntropy, LinesActionModel
-from zea.backend.autograd import AutoGrad
 from zea.internal.registry import action_selection_registry
 
 
@@ -55,38 +54,30 @@ class DownstreamTaskSelection(GreedyEntropy):
     def compute_output_and_saliency_propagation_hutchinson(self, particles, key):
         num_hutchinson_samples = 5
 
-        z_squared = ops.zeros(self.downstream_task.output_shape)
-        for i in range(num_hutchinson_samples):  # TODO: vmap
-            subkey = jax.random.fold_in(key, i)
-            v = jax.random.normal(
-                subkey, self.downstream_task
-            )  # TODO: downstream task output shape?
-            # vjp returns a function that computes J^T v
-            _, vjp_fun = jax.vjp(self.downstream_task.call_differentiable, particles)
-            jt_v = vjp_fun(v)[0]  # [0] to get the input tangent
-            z_squared += jt_v**2
+        particles_t = torch.as_tensor(particles, dtype=torch.float32)
+        particles_t.requires_grad_(True)
+        z_squared = torch.zeros_like(particles_t)
 
-        posterior_variance = ops.expand_dims(ops.var(particles, axis=0), axis=0)
+        for _ in range(num_hutchinson_samples):  # TODO: vmap
+            output = self.downstream_task.call_differentiable(particles_t)
+            v = torch.randn_like(output)
+            grad = torch.autograd.grad(
+                (output * v).sum(), particles_t, retain_graph=True
+            )[0]
+            z_squared = z_squared + grad**2
 
-        return (
-            posterior_variance * z_squared
-        )  # TODO: where does z_squared get rid of the particle dim?
+        posterior_variance = torch.var(particles_t.detach(), dim=0, keepdim=True)
+
+        return posterior_variance * z_squared.detach()
 
     def compute_output_and_saliency_propagation_summed(self, particles):
-        autograd = AutoGrad()
-
-        def call_model(model_input):
-            model_output = self.downstream_task.call_differentiable(model_input)
-            return ops.sum(model_output)
-
-        autograd.set_function(call_model)
-        echonet_grad_and_value_fn = autograd.get_gradient_and_value_jit_fn()
-        grads, _ = echonet_grad_and_value_fn(particles)
-
-        posterior_variance = ops.expand_dims(ops.var(particles, axis=0), axis=0)
-        mean_absolute_jacobian = ops.expand_dims(
-            ops.mean(ops.abs(grads), axis=0), axis=0
-        )
+        particles_t = torch.as_tensor(particles, dtype=torch.float32)
+        particles_t.requires_grad_(True)
+        model_output = self.downstream_task.call_differentiable(particles_t)
+        loss = model_output.sum()
+        grads = torch.autograd.grad(loss, particles_t)[0]
+        posterior_variance = torch.var(particles_t.detach(), dim=0, keepdim=True)
+        mean_absolute_jacobian = torch.mean(torch.abs(grads), dim=0, keepdim=True)
         return posterior_variance * mean_absolute_jacobian
 
     def sum_neighbouring_columns_into_n_possible_actions(self, full_linewise_salience):
